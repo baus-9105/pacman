@@ -1,0 +1,9 @@
+# Virtual environment
+venv/
+.venv/
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/

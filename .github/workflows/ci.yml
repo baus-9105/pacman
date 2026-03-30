@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - '*'
+  pull_request:
+    branches:
+      - main
+
+env:
+  PYTHON_VER: '3.11'
+  RUFF_TARGET: 'py311'
+  ID_TEAM: 'WAG'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VER }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+    
+      - name: Install the code linting and formatting tool Ruff
+        run: pip install ruff
+      - name: Lint code with Ruff
+        run: ruff check --output-format=github --target-version=${{ env.RUFF_TARGET }}
+      - name: Check code formatting with Ruff
+        run: ruff format --diff --target-version=${{ env.RUFF_TARGET }}
+        continue-on-error: true
+
+      - name: Run the project
+        working-directory: ./src
+        run: |
+          python arena.py --seek "$ID_TEAM" --hide example_student
+          python arena.py --seek example_student --hide "$ID_TEAM"
+          python arena.py --seek "$ID_TEAM" --hide "$ID_TEAM"

@@ -152,16 +152,19 @@ class PacmanAgent(BasePacmanAgent):
 
 class GhostAgent(BaseGhostAgent):
     """
-    Ghost (Hider) Agent - Goal: Avoid being caught
+    Ghost (Hider) Agent - Risk-Aware Strategy #4
     
-    Implement your search algorithm to evade Pacman as long as possible.
-    Suggested algorithms: BFS (find furthest point), Minimax, Monte Carlo
+    Intelligently avoids Pacman by assessing threat level and adapting behavior:
+    - HIGH ALERT (distance <= 5): Escape mode - maximize distance
+    - MEDIUM ALERT (distance <= 10): Strategic retreat - balance distance + wall cover
+    - LOW ALERT (distance > 10): Explore dead-ends - safer areas harder to reach
     """
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # TODO: Initialize any data structures you need
-        # Memory for limited observation mode
+        self.name = "Risk-Aware Ghost"
+        self.DANGER_DISTANCE = 5  # Critical: activate panic mode
+        self.SAFE_DISTANCE = 10   # Safe: explore freely
         self.last_known_enemy_pos = None
     
     def step(self, map_state: np.ndarray, 
@@ -169,7 +172,7 @@ class GhostAgent(BaseGhostAgent):
              enemy_position: tuple,
              step_number: int) -> Move:
         """
-        Decide the next move.
+        Smart evasion based on threat assessment.
         
         Args:
             map_state: 2D numpy array where 1=wall, 0=empty, -1=unseen (fog)
@@ -178,44 +181,110 @@ class GhostAgent(BaseGhostAgent):
             step_number: Current step number (starts at 1)
             
         Returns:
-            Move: One of Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT, Move.STAY
+            Move: Adaptive move based on risk level
         """
-        # TODO: Implement your search algorithm here
-        
-        # Update memory if enemy is visible
+        # Update memory if Pacman is visible
         if enemy_position is not None:
             self.last_known_enemy_pos = enemy_position
         
-        # Use current sighting, fallback to last known, or move randomly
-        threat = enemy_position or self.last_known_enemy_pos
+        pacman_pos = enemy_position or self.last_known_enemy_pos
         
-        if threat is None:
-            # No information about enemy - move randomly
-            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                if self._is_valid_move(my_position, move, map_state):
-                    return move
-            return Move.STAY
+        # No information about Pacman - explore safely
+        if pacman_pos is None:
+            return self._explore_safely(my_position, map_state)
         
-        # Example: Simple evasive approach (replace with your algorithm)
-        row_diff = my_position[0] - threat[0]
-        col_diff = my_position[1] - threat[1]
+        # Assess threat level
+        distance = self._manhattan_distance(my_position, pacman_pos)
         
-        # Try to move away from Pacman
-        if abs(row_diff) > abs(col_diff):
-            move = Move.DOWN if row_diff > 0 else Move.UP
+        # HIGH ALERT: Pacman is dangerously close!
+        if distance <= self.DANGER_DISTANCE:
+            return self._escape_panic(my_position, pacman_pos, map_state)
+        
+        # MEDIUM ALERT: Move away steadily while seeking protection
+        elif distance <= self.SAFE_DISTANCE:
+            return self._move_away_strategically(my_position, pacman_pos, map_state)
+        
+        # LOW ALERT: Safe zone - explore dead-ends (hard to reach areas)
         else:
-            move = Move.RIGHT if col_diff > 0 else Move.LEFT
+            return self._explore_dead_ends(my_position, map_state)
+    
+    def _escape_panic(self, pos: tuple, pacman_pos: tuple, map_state: np.ndarray) -> Move:
+        """
+        Panic mode: Maximize distance to Pacman immediately.
+        Used when danger is imminent (distance <= 5).
+        """
+        best_move = Move.STAY
+        max_distance = self._manhattan_distance(pos, pacman_pos)
         
-        # Check if move is valid
-        if self._is_valid_move(my_position, move, map_state):
-            return move
-        
-        # If not valid, try other moves
         for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-            if self._is_valid_move(my_position, move, map_state):
-                return move
+            if self._is_valid_move(pos, move, map_state):
+                next_pos = self._apply_move(pos, move)
+                distance = self._manhattan_distance(next_pos, pacman_pos)
+                if distance > max_distance:
+                    max_distance = distance
+                    best_move = move
         
-        return Move.STAY
+        return best_move
+    
+    def _move_away_strategically(self, pos: tuple, pacman_pos: tuple, map_state: np.ndarray) -> Move:
+        """
+        Strategic retreat: Balance distance from Pacman + wall shelter.
+        Used when threat is moderate (5 < distance <= 10).
+        Score = distance + (wall_count * 0.5)
+        """
+        best_move = Move.STAY
+        best_score = -float('inf')
+        
+        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            if self._is_valid_move(pos, move, map_state):
+                next_pos = self._apply_move(pos, move)
+                distance = self._manhattan_distance(next_pos, pacman_pos)
+                walls = self._count_adjacent_walls(next_pos, map_state)
+                
+                # Combine distance and wall protection
+                score = distance + walls * 0.5
+                
+                if score > best_score:
+                    best_score = score
+                    best_move = move
+        
+        return best_move
+    
+    def _explore_dead_ends(self, pos: tuple, map_state: np.ndarray) -> Move:
+        """
+        Low-threat exploration: Seek dead-end corridors (many walls).
+        Dead-ends are strategically safer (harder for Pacman to reach).
+        """
+        best_move = Move.STAY
+        best_deadend_score = self._count_adjacent_walls(pos, map_state)
+        
+        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            if self._is_valid_move(pos, move, map_state):
+                next_pos = self._apply_move(pos, move)
+                wall_count = self._count_adjacent_walls(next_pos, map_state)
+                
+                if wall_count > best_deadend_score:
+                    best_deadend_score = wall_count
+                    best_move = move
+        
+        return best_move
+    
+    def _explore_safely(self, pos: tuple, map_state: np.ndarray) -> Move:
+        """
+        Explore when Pacman is not visible: prefer dead-ends.
+        """
+        best_move = Move.STAY
+        best_score = self._count_adjacent_walls(pos, map_state)
+        
+        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            if self._is_valid_move(pos, move, map_state):
+                next_pos = self._apply_move(pos, move)
+                score = self._count_adjacent_walls(next_pos, map_state)
+                if score > best_score:
+                    best_score = score
+                    best_move = move
+        
+        return best_move
     
     # Helper methods (you can add more)
     
@@ -234,3 +303,79 @@ class GhostAgent(BaseGhostAgent):
             return False
         
         return map_state[row, col] == 0
+
+    def _manhattan_distance(self, pos1, pos2):
+        return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
+
+    def _count_adjacent_walls(self, pos, map_state):
+        count = 0
+        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            next_pos = self._apply_move(pos, move)
+            if not self._is_valid_position(next_pos, map_state):
+                count += 1
+        return count
+
+    def _apply_move(self, pos, move):
+        delta_row, delta_col = move.value
+        return (pos[0] + delta_row, pos[1] + delta_col)
+
+    def _explore_safely(self, pos, map_state):
+        """Move to a safe position."""
+        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            if self._is_valid_move(pos, move, map_state):
+                return move
+        return Move.STAY
+
+    def _escape_panic(self, pos, pacman_pos, map_state):
+        """Escape mode: move to furthest reachable position."""
+        best_move = Move.STAY
+        max_distance = 0
+        
+        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            if self._is_valid_move(pos, move, map_state):
+                next_pos = self._apply_move(pos, move)
+                distance = self._manhattan_distance(next_pos, pacman_pos)
+                if distance > max_distance:
+                    max_distance = distance
+                    best_move = move
+        
+        return best_move
+    
+    def _move_away_strategically(self, pos, pacman_pos, map_state):
+        """Balance between distance and wall protection."""
+        best_move = Move.STAY
+        best_score = -float('inf')
+        
+        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            if self._is_valid_move(pos, move, map_state):
+                next_pos = self._apply_move(pos, move)
+                distance = self._manhattan_distance(next_pos, pacman_pos)
+                walls = self._count_adjacent_walls(next_pos, map_state)
+                
+                # Prefer: distance + wall protection
+                score = distance + walls * 0.5
+                
+                if score > best_score:
+                    best_score = score
+                    best_move = move
+        
+        return best_move
+    
+    def _explore_dead_ends(self, pos, map_state):
+        """When safe, explore dead-end corridors."""
+        # Dead-ends are hard for Pacman to reach
+        best_move = Move.STAY
+        best_deadend_score = self._count_adjacent_walls(pos, map_state)
+        
+        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            if self._is_valid_move(pos, move, map_state):
+                next_pos = self._apply_move(pos, move)
+                score = self._count_adjacent_walls(next_pos, map_state)
+                if score > best_deadend_score:
+                    best_deadend_score = score
+                    best_move = move
+        
+        return best_move
+
+    def __str__(self):
+        return f"GhostAgent(DANGER_DISTANCE={self.DANGER_DISTANCE}, SAFE_DISTANCE={self.SAFE_DISTANCE})"

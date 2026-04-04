@@ -11,7 +11,7 @@ on:
 env:
   PYTHON_VER: '3.11'
   RUFF_TARGET: 'py311'
-  ID_TEAM: 'WAG'
+  ID_TEAM: '3'
 
 jobs:
   build:

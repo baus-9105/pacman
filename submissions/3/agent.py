@@ -31,6 +31,7 @@ from agent_interface import PacmanAgent as BasePacmanAgent
 from agent_interface import GhostAgent as BaseGhostAgent
 from environment import Move
 import numpy as np
+import heapq
 
 
 class PacmanAgent(BasePacmanAgent):
@@ -48,9 +49,13 @@ class PacmanAgent(BasePacmanAgent):
         # Examples:
         # - self.path = []  # Store planned path
         # - self.visited = set()  # Track visited positions
-        self.name = "Template Pacman"
+        self.name = "WAG Hunter"
+        self.path = []
+        self.cached_target = None
+        self.visited = {}
         # Memory for limited observation mode
         self.last_known_enemy_pos = None
+        self.last_enemy_pos = None
     
     def step(self, map_state: np.ndarray, 
              my_position: tuple, 
@@ -69,59 +74,194 @@ class PacmanAgent(BasePacmanAgent):
             Move or (Move, steps): Direction to move (optionally with step count)
         """
         # TODO: Implement your search algorithm here
-        
+        self.visited[my_position] = self.visited.get(my_position, 0) + 1
+
         # Update memory if enemy is visible
         if enemy_position is not None:
             self.last_known_enemy_pos = enemy_position
-        
-        # Use current sighting, fallback to last known, or explore
-        target = enemy_position or self.last_known_enemy_pos
-        
-        if target is None:
-            # No information about enemy - explore randomly
-            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                if self._is_valid_move(my_position, move, map_state):
-                    return (move, 1)
-            return (Move.STAY, 1)
-        
-        # Example: Simple greedy approach (replace with your algorithm)
-        row_diff = target[0] - my_position[0]
-        col_diff = target[1] - my_position[1]
-        
-        # Try to move towards ghost
-        if abs(row_diff) > abs(col_diff):
-            primary_move = Move.DOWN if row_diff > 0 else Move.UP
-            desired_steps = abs(row_diff)
-        else:
-            primary_move = Move.RIGHT if col_diff > 0 else Move.LEFT
-            desired_steps = abs(col_diff)
 
-        action = self._choose_action(
-            my_position,
-            [primary_move],
-            map_state,
-            desired_steps
-        )
-        if action:
-            return action
+        planned_action = None
 
-        # If the primary direction is blocked, try other moves
-        fallback_moves = [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]
-        action = self._choose_action(my_position, fallback_moves, map_state, self.pacman_speed)
-        if action:
-            return action
-        
-        return (Move.STAY, 1)
+        # Visible enemy: pursue with predicted interception points.
+        if enemy_position is not None:
+            candidate_targets = self._predict_enemy_positions(enemy_position, map_state)
+            planned_action = self._best_action_to_any_target(my_position, candidate_targets, map_state)
+            self.last_enemy_pos = enemy_position
+
+        # Not visible: chase last known location first.
+        if planned_action is None and self.last_known_enemy_pos is not None:
+            planned_action = self._best_action_to_any_target(
+                my_position,
+                [self.last_known_enemy_pos],
+                map_state
+            )
+
+        # If no direct chase target is available, explore toward nearest unseen cells.
+        if planned_action is None:
+            explore_target = self._choose_exploration_target(my_position, map_state)
+            if explore_target is not None:
+                planned_action = self._best_action_to_any_target(
+                    my_position,
+                    [explore_target],
+                    map_state
+                )
+
+        if planned_action is not None:
+            return planned_action
+
+        # Emergency fallback: choose the least-visited valid move.
+        return self._fallback_move(my_position, map_state)
     
     # Helper methods (you can add more)
     
-    def _choose_action(self, pos: tuple, moves, map_state: np.ndarray, desired_steps: int):
-        for move in moves:
-            max_steps = min(self.pacman_speed, max(1, desired_steps))
-            steps = self._max_valid_steps(pos, move, map_state, max_steps)
-            if steps > 0:
-                return (move, steps)
+    def _best_action_to_any_target(self, start: tuple, targets, map_state: np.ndarray):
+        best_path = None
+        best_score = None
+
+        for target in targets:
+            if target is None or not self._is_valid_position(target, map_state):
+                continue
+            path = self._a_star(start, target, map_state)
+            if not path:
+                continue
+
+            # Prefer shorter path, then lower heuristic distance after first move.
+            score = len(path)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_path = path
+
+        if not best_path:
+            return None
+
+        return self._compress_path_to_action(start, best_path, map_state)
+
+    def _predict_enemy_positions(self, enemy_pos: tuple, map_state: np.ndarray):
+        candidates = [enemy_pos]
+        if self.last_enemy_pos is None:
+            return candidates
+
+        dr = enemy_pos[0] - self.last_enemy_pos[0]
+        dc = enemy_pos[1] - self.last_enemy_pos[1]
+        if dr == 0 and dc == 0:
+            return candidates
+
+        # Predict likely future ghost positions (1-3 turns ahead).
+        r, c = enemy_pos
+        for k in range(1, 4):
+            nxt = (r + dr * k, c + dc * k)
+            if not self._is_valid_position(nxt, map_state):
+                break
+            candidates.append(nxt)
+        return candidates
+
+    def _choose_exploration_target(self, start: tuple, map_state: np.ndarray):
+        h, w = map_state.shape
+        unseen_cells = []
+        for r in range(h):
+            for c in range(w):
+                if map_state[r, c] == -1:
+                    unseen_cells.append((r, c))
+
+        if not unseen_cells:
+            return None
+
+        # Try a few nearest unseen cells by Manhattan distance to keep runtime low.
+        unseen_cells.sort(key=lambda p: self._manhattan(start, p))
+        for candidate in unseen_cells[:24]:
+            if self._a_star(start, candidate, map_state):
+                return candidate
+        return unseen_cells[0]
+
+    def _fallback_move(self, pos: tuple, map_state: np.ndarray):
+        candidates = []
+        for move in [Move.UP, Move.LEFT, Move.DOWN, Move.RIGHT]:
+            steps = self._max_valid_steps(pos, move, map_state, self.pacman_speed)
+            if steps <= 0:
+                continue
+            delta_row, delta_col = move.value
+            next_pos = (pos[0] + delta_row, pos[1] + delta_col)
+            visit_penalty = self.visited.get(next_pos, 0)
+            candidates.append((visit_penalty, -steps, move, steps))
+
+        if not candidates:
+            return (Move.STAY, 1)
+
+        candidates.sort()
+        _, _, move, steps = candidates[0]
+        return (move, steps)
+
+    def _compress_path_to_action(self, start: tuple, path, map_state: np.ndarray):
+        if not path:
+            return None
+
+        first_move = path[0]
+        steps = 0
+        current = start
+
+        for move in path:
+            if move != first_move or steps >= self.pacman_speed:
+                break
+            delta_row, delta_col = move.value
+            nxt = (current[0] + delta_row, current[1] + delta_col)
+            if not self._is_valid_position(nxt, map_state):
+                break
+            current = nxt
+            steps += 1
+
+        if steps == 0:
+            return None
+        return (first_move, steps)
+
+    def _a_star(self, start: tuple, goal: tuple, map_state: np.ndarray):
+        if start == goal:
+            return []
+
+        open_heap = []
+        g_score = {start: 0}
+        came_from = {}
+        move_from = {}
+        counter = 0
+
+        heapq.heappush(open_heap, (self._manhattan(start, goal), 0, counter, start))
+
+        while open_heap:
+            _, current_g, _, current = heapq.heappop(open_heap)
+            if current == goal:
+                return self._reconstruct_path(came_from, move_from, current)
+
+            # Skip outdated heap entries.
+            if current_g != g_score.get(current, current_g):
+                continue
+
+            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+                delta_row, delta_col = move.value
+                nxt = (current[0] + delta_row, current[1] + delta_col)
+                if not self._is_valid_position(nxt, map_state):
+                    continue
+
+                tentative_g = current_g + 1
+                if tentative_g < g_score.get(nxt, 10**9):
+                    g_score[nxt] = tentative_g
+                    came_from[nxt] = current
+                    move_from[nxt] = move
+                    counter += 1
+                    f = tentative_g + self._manhattan(nxt, goal)
+                    heapq.heappush(open_heap, (f, tentative_g, counter, nxt))
+
         return None
+
+    def _reconstruct_path(self, came_from, move_from, end_node):
+        moves = []
+        cur = end_node
+        while cur in came_from:
+            moves.append(move_from[cur])
+            cur = came_from[cur]
+        moves.reverse()
+        return moves
+
+    def _manhattan(self, a: tuple, b: tuple) -> int:
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
     def _max_valid_steps(self, pos: tuple, move: Move, map_state: np.ndarray, max_steps: int) -> int:
         steps = 0
@@ -147,7 +287,7 @@ class PacmanAgent(BasePacmanAgent):
         if row < 0 or row >= height or col < 0 or col >= width:
             return False
         
-        return map_state[row, col] == 0
+        return map_state[row, col] != 1
 
 
 class GhostAgent(BaseGhostAgent):
@@ -162,7 +302,7 @@ class GhostAgent(BaseGhostAgent):
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.name = "Risk-Aware Ghost"
+        self.name = "WAG Ghost"
         self.DANGER_DISTANCE = 5  # Critical: activate panic mode
         self.SAFE_DISTANCE = 10   # Safe: explore freely
         self.last_known_enemy_pos = None

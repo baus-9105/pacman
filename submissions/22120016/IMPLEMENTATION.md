@@ -106,3 +106,53 @@ The implementation follows required rules:
 - Pacman returns Move or (Move, steps).
 - No external third-party libraries added.
 - Uses standard library plus framework-provided imports.
+
+## Ghost Agent Implementation
+
+The hider agent was reworked from a simple greedy escape into a stronger adversarial survival policy.
+
+### Main Goal
+- Maximize survival time by avoiding Pacman's capture radius.
+- Prefer positions that are hard for Pacman to reach quickly.
+
+### Core Ideas
+- Model Pacman as a speed-limited attacker that can move multiple cells in one straight line.
+- Score each ghost move by the danger of the resulting position.
+- Prefer cells with more exits and fewer repeat visits.
+- Use maze-distance evaluation instead of only Manhattan distance.
+
+### What the Ghost Tracks
+- last_known_enemy_pos: latest visible Pacman position.
+- last_enemy_pos: previous visible Pacman position for motion continuity.
+- last_move: used to reduce backtracking.
+- visited: counts how often each cell was used.
+
+### Decision Flow
+1. If Pacman is visible, update memory and evaluate all valid ghost moves.
+2. For each candidate move, compute a safety score.
+3. Estimate Pacman's reachable cells for the current turn.
+4. Use a maze-distance map from the ghost candidate cell to measure threat.
+5. Prefer the move with the highest survival score.
+6. If Pacman is hidden, keep moving toward safer, less visited open cells.
+
+### Safety Scoring
+The score combines:
+- maze distance from Pacman reachable positions,
+- a one-turn lookahead safety estimate,
+- number of exits from the cell,
+- revisit penalty,
+- reverse-move penalty.
+
+This is designed to avoid corridors, dead ends, and local loops.
+
+### Why This Is Stronger
+- It reacts to the actual arena movement rule where Pacman can move more than one cell straight.
+- It avoids choosing cells that look far in Manhattan distance but are still easy to catch in a corridor.
+- It keeps the ghost moving even when Pacman is outside vision.
+
+### Notes
+- The ghost uses only standard Python and NumPy.
+- The implementation is intentionally lightweight enough to stay within the per-step time limit.
+
+### Verification
+- In a local benchmark against example_student as Pacman, the ghost survived the full 200-step limit.

@@ -32,6 +32,7 @@ from agent_interface import GhostAgent as BaseGhostAgent
 from environment import Move
 import numpy as np
 import heapq
+from collections import deque
 
 
 class PacmanAgent(BasePacmanAgent):
@@ -301,8 +302,13 @@ class GhostAgent(BaseGhostAgent):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         # TODO: Initialize any data structures you need
+        self.pacman_speed = max(1, int(kwargs.get("pacman_speed", 2)))
         # Memory for limited observation mode
         self.last_known_enemy_pos = None
+        self.last_enemy_pos = None
+        self.last_move = Move.STAY
+        self.visited = {}
+        self.escape_target = None
     
     def step(self, map_state: np.ndarray, 
              my_position: tuple, 
@@ -321,43 +327,277 @@ class GhostAgent(BaseGhostAgent):
             Move: One of Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT, Move.STAY
         """
         # TODO: Implement your search algorithm here
+        self.visited[my_position] = self.visited.get(my_position, 0) + 1
         
         # Update memory if enemy is visible
         if enemy_position is not None:
             self.last_known_enemy_pos = enemy_position
+            self.last_enemy_pos = enemy_position
         
-        # Use current sighting, fallback to last known, or move randomly
+        # Use current sighting, fallback to last known, or explore safely
         threat = enemy_position or self.last_known_enemy_pos
         
         if threat is None:
-            # No information about enemy - move randomly
-            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                if self._is_valid_move(my_position, move, map_state):
-                    return move
-            return Move.STAY
-        
-        # Example: Simple evasive approach (replace with your algorithm)
-        row_diff = my_position[0] - threat[0]
-        col_diff = my_position[1] - threat[1]
-        
-        # Try to move away from Pacman
-        if abs(row_diff) > abs(col_diff):
-            move = Move.DOWN if row_diff > 0 else Move.UP
-        else:
-            move = Move.RIGHT if col_diff > 0 else Move.LEFT
-        
-        # Check if move is valid
-        if self._is_valid_move(my_position, move, map_state):
+            move = self._explore_move(my_position, map_state)
+            self.last_move = move
             return move
-        
-        # If not valid, try other moves
-        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-            if self._is_valid_move(my_position, move, map_state):
-                return move
-        
-        return Move.STAY
+
+        target = self._choose_escape_target(my_position, threat, map_state)
+        if target is not None:
+            self.escape_target = target
+
+        if self.escape_target is not None:
+            if not self._is_valid_position(self.escape_target, map_state):
+                self.escape_target = None
+            else:
+                path = self._bfs_path(my_position, self.escape_target, map_state)
+                if path:
+                    move = path[0]
+                    self.last_move = move
+                    return move
+
+        move = self._best_escape_move(my_position, threat, map_state)
+        self.last_move = move
+        return move
     
     # Helper methods (you can add more)
+
+    def _best_escape_move(self, my_position: tuple, threat: tuple, map_state: np.ndarray) -> Move:
+        pacman_reachable = self._pacman_reachable_positions(threat, map_state)
+        candidates = []
+
+        for move in [Move.UP, Move.LEFT, Move.DOWN, Move.RIGHT, Move.STAY]:
+            next_pos = self._apply_move(my_position, move, map_state)
+            if move != Move.STAY and next_pos == my_position:
+                continue
+
+            score = self._evaluate_escape_state(
+                ghost_pos=next_pos,
+                pacman_positions=pacman_reachable,
+                map_state=map_state,
+                move=move
+            )
+            candidates.append((score, move))
+
+        if not candidates:
+            return Move.STAY
+
+        candidates.sort(reverse=True, key=lambda item: item[0])
+        return candidates[0][1]
+
+    def _choose_escape_target(self, my_position: tuple, threat: tuple, map_state: np.ndarray):
+        pacman_reachable = self._pacman_reachable_positions(threat, map_state)
+        threat_map = self._multi_source_distance_map(pacman_reachable, map_state)
+        reachable_cells = self._reachable_cells_from(my_position, map_state)
+
+        best_cell = None
+        best_score = None
+
+        for cell in reachable_cells:
+            if not self._is_valid_position(cell, map_state):
+                continue
+
+            threat_dist = threat_map.get(cell, 10**6)
+            exits = self._exit_count(cell, map_state)
+            visits = self.visited.get(cell, 0)
+            dist_from_me = self._manhattan(my_position, cell)
+
+            # Strongly prefer cells that are far from all currently reachable Pacman positions,
+            # have multiple exits, and are not repeatedly visited.
+            score = (
+                40.0 * threat_dist
+                + 4.0 * exits
+                - 1.25 * visits
+                - 0.10 * dist_from_me
+            )
+
+            if best_score is None or score > best_score:
+                best_score = score
+                best_cell = cell
+
+        return best_cell
+
+    def _evaluate_escape_state(self, ghost_pos: tuple, pacman_positions, map_state: np.ndarray, move: Move) -> float:
+        # Safety is primarily the maze-distance to the closest cell Pacman can reach this turn.
+        threat_map = self._multi_source_distance_map(pacman_positions, map_state)
+        nearest_threat = threat_map.get(ghost_pos, 10**6)
+
+        # If Pacman can touch this cell, strongly avoid it.
+        if nearest_threat <= 1:
+            return -10000.0
+
+        # Estimate how much room the ghost has to keep escaping.
+        safe_area = self._safe_area_size(ghost_pos, threat_map, map_state)
+
+        # Prefer cells with more exits and fewer repeats.
+        exits = self._exit_count(ghost_pos, map_state)
+        visit_penalty = self.visited.get(ghost_pos, 0)
+        reverse_penalty = 2.0 if self._is_reverse(move, self.last_move) else 0.0
+
+        # Pull toward cells that are expensive for Pacman to reach and easy to keep escaping from.
+        return (
+            30.0 * nearest_threat
+            + 0.8 * safe_area
+            + 6.0 * exits
+            - 2.0 * visit_penalty
+            - reverse_penalty
+        )
+
+    def _explore_move(self, my_position: tuple, map_state: np.ndarray) -> Move:
+        if self.last_known_enemy_pos is not None:
+            threat = self.last_known_enemy_pos
+            return self._best_escape_move(my_position, threat, map_state)
+
+        candidates = []
+        for move in [Move.UP, Move.LEFT, Move.DOWN, Move.RIGHT, Move.STAY]:
+            next_pos = self._apply_move(my_position, move, map_state)
+            if move != Move.STAY and next_pos == my_position:
+                continue
+
+            exits = self._exit_count(next_pos, map_state)
+            score = 4.0 * exits - 1.5 * self.visited.get(next_pos, 0)
+            if self._is_reverse(move, self.last_move):
+                score -= 2.0
+            candidates.append((score, move))
+
+        if not candidates:
+            return Move.STAY
+
+        candidates.sort(reverse=True, key=lambda item: item[0])
+        return candidates[0][1]
+
+    def _pacman_reachable_positions(self, pacman_pos: tuple, map_state: np.ndarray):
+        reachable = {pacman_pos}
+        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            current = pacman_pos
+            for _ in range(self.pacman_speed):
+                nxt = self._apply_move(current, move, map_state)
+                if nxt == current:
+                    break
+                reachable.add(nxt)
+                current = nxt
+        return reachable
+
+    def _distance_map_from(self, start: tuple, map_state: np.ndarray):
+        dist = {start: 0}
+        queue = deque([start])
+        while queue:
+            current = queue.popleft()
+            current_dist = dist[current]
+            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+                nxt = self._apply_move(current, move, map_state)
+                if nxt == current or nxt in dist:
+                    continue
+                dist[nxt] = current_dist + 1
+                queue.append(nxt)
+        return dist
+
+    def _multi_source_distance_map(self, sources, map_state: np.ndarray):
+        queue = deque()
+        dist = {}
+        for source in sources:
+            if source in dist:
+                continue
+            dist[source] = 0
+            queue.append(source)
+
+        while queue:
+            current = queue.popleft()
+            current_dist = dist[current]
+            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+                nxt = self._apply_move(current, move, map_state)
+                if nxt == current or nxt in dist:
+                    continue
+                dist[nxt] = current_dist + 1
+                queue.append(nxt)
+        return dist
+
+    def _safe_area_size(self, start: tuple, threat_map, map_state: np.ndarray) -> int:
+        # Count cells that are not too close to Pacman and remain reachable from the candidate cell.
+        queue = deque([start])
+        seen = {start}
+        safe = 0
+
+        while queue:
+            current = queue.popleft()
+            if threat_map.get(current, 10**6) > 2:
+                safe += 1
+
+            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+                nxt = self._apply_move(current, move, map_state)
+                if nxt == current or nxt in seen:
+                    continue
+                seen.add(nxt)
+                queue.append(nxt)
+
+        return safe
+
+    def _reachable_cells_from(self, start: tuple, map_state: np.ndarray):
+        queue = deque([start])
+        seen = {start}
+        while queue:
+            current = queue.popleft()
+            yield current
+            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+                nxt = self._apply_move(current, move, map_state)
+                if nxt == current or nxt in seen:
+                    continue
+                seen.add(nxt)
+                queue.append(nxt)
+
+    def _bfs_path(self, start: tuple, goal: tuple, map_state: np.ndarray):
+        if start == goal:
+            return []
+
+        queue = deque([start])
+        parent = {start: None}
+        move_used = {}
+
+        while queue:
+            current = queue.popleft()
+            if current == goal:
+                break
+
+            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+                nxt = self._apply_move(current, move, map_state)
+                if nxt == current or nxt in parent:
+                    continue
+                parent[nxt] = current
+                move_used[nxt] = move
+                queue.append(nxt)
+
+        if goal not in parent:
+            return None
+
+        path = []
+        current = goal
+        while parent[current] is not None:
+            path.append(move_used[current])
+            current = parent[current]
+        path.reverse()
+        return path
+
+    def _apply_move(self, pos: tuple, move: Move, map_state: np.ndarray) -> tuple:
+        delta_row, delta_col = move.value
+        new_pos = (pos[0] + delta_row, pos[1] + delta_col)
+        if self._is_valid_position(new_pos, map_state):
+            return new_pos
+        return pos
+
+    def _exit_count(self, pos: tuple, map_state: np.ndarray) -> int:
+        exits = 0
+        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            if self._apply_move(pos, move, map_state) != pos:
+                exits += 1
+        return exits
+
+    def _manhattan(self, a: tuple, b: tuple) -> int:
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    def _is_reverse(self, move: Move, previous: Move) -> bool:
+        if move == Move.STAY or previous == Move.STAY:
+            return False
+        return move.value[0] == -previous.value[0] and move.value[1] == -previous.value[1]
     
     def _is_valid_move(self, pos: tuple, move: Move, map_state: np.ndarray) -> bool:
         """Check if a move from pos is valid."""

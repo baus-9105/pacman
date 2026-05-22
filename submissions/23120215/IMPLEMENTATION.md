@@ -1,299 +1,362 @@
-# Implementation Documentation
+# Lab 2 – Blind Adversary: Implementation Document
+
+## 1. Problem Statement
+
+Both agents operate under **partial observability**: instead of seeing the full 21×21 map,
+each agent perceives only a cross-shaped field of view extending **5 cells** in each cardinal
+direction, blocked by walls. The `enemy_position` parameter is `None` whenever the opponent
+is outside the agent's line of sight, and empty cells beyond the FOV are marked as `−1`
+(unseen) in the `map_state` array.
+
+The challenge is to **seek** (Pacman) or **hide** (Ghost) effectively when the opponent's
+location is unknown most of the time.
+
+| Setting | Value |
+|---------|-------|
+| Map size | 21 × 21 |
+| FOV shape | Cross (cardinal rays) |
+| FOV radius | 5 cells, blocked by walls |
+| Pacman speed | 2 cells/step (straight line only) |
+| Capture condition | Manhattan distance < 2 |
+| Max steps | 200 |
+| Time budget | 1 second per step |
+| Memory budget | 16 MB |
 
 ---
 
-## Table of Contents
-
-1. [Overview](#overview)
-2. [PacmanAgent (Seeker)](#pacmanagent-seeker)
-3. [GhostAgent (Hider)](#ghostagent-hider)
-4. [Shared Algorithms](#shared-algorithms)
-5. [Design Decisions](#design-decisions)
-6. [Complexity Analysis](#complexity-analysis)
-7. [Testing](#testing)
-
----
-
-## Overview
-
-This agent implements advanced AI strategies for both the Pacman (seeker) and Ghost (hider) roles. The core philosophy:
-
-- **Pacman**: "Predict, intercept, and corner" — don't chase where the Ghost *is*, chase where it *will be*.
-- **Ghost**: "Maximise true distance, never get cornered" — use wall-aware BFS distance (not Manhattan), avoid dead-ends, stay near junctions.
-
-Both agents use **depth-4 minimax** for close-combat decisions, with the Ghost adding **alpha-beta pruning** for efficiency.
-
-### Architecture
+## 2. Architecture Overview
 
 ```
-step() is called each turn
-  │
-  ├── Enemy visible?
-  │     ├── Close range  →  Minimax (adversarial lookahead)
-  │     ├── Medium range →  A* / BFS-distance heuristics
-  │     └── Far range    →  A* pathfinding / distance maximisation
-  │
-  ├── Enemy last known?
-  │     └── Chase / flee from last known position
-  │
-  └── No info (fog)?
-        └── Exploration / junction-seeking wander
+agent.py
+├── Shared utilities
+│   ├── is_valid()          – bounds + wall check (known-empty only)
+│   ├── is_passable()       – bounds + non-wall check (allows unseen)
+│   ├── a_star()            – A* with optional optimistic traversal
+│   ├── pacman_next_positions()     – speed-2 reachability (1 turn)
+│   └── pacman_turn_distances()     – BFS modelling speed-2 per turn
+├── MemoryMap               – persistent map built from partial observations
+├── PacmanAgent             – seek agent
+│   ├── _chase()            – A* + speed-2 when enemy visible
+│   ├── _search()           – frontier exploration when enemy hidden
+│   └── _find_frontier_target()  – BFS to nearest exploration boundary
+└── GhostAgent              – hide agent
+    ├── Belief map           – Bayesian probability grid for Pacman's location
+    │   ├── _predict_belief()   – motion-model prediction step
+    │   ├── _belief_centroid()  – weighted mean of belief distribution
+    │   └── observation update  – positive/negative evidence
+    ├── _panic()             – 2-ply minimax for close encounters
+    ├── _caution()           – weighted multi-factor scoring
+    └── _calm()              – A* to safest haven cell
 ```
 
 ---
 
-## PacmanAgent (Seeker)
+## 3. Key Components
 
-### Strategy Layers (highest priority first)
+### 3.1 Memory Map (`MemoryMap` class)
 
-#### Layer 1: Minimax Close-Combat (Manhattan distance ≤ 8)
-
-When the Ghost is within 8 tiles, Pacman uses **depth-4 minimax** to find the optimal capture move.
+Both agents maintain a **persistent map** that accumulates every observation across steps.
 
 ```
-_minimax_chase(pac_pos, ghost_pos, map_state, depth=4)
-  └── For each valid direction:
-        ├── Simulate full-speed movement (pacman_speed steps)
-        └── Evaluate with _mm_pac() minimax tree
-              ├── Pacman turn: minimise distance (wants to get closer)
-              └── Ghost turn: maximise distance (assumes Ghost plays optimally)
+Step 1:  Agent sees cells around (15,10)  →  those cells are revealed (0)
+Step 2:  Agent moves to (14,10)           →  new cells revealed, old ones remembered
+...
+Step N:  Most of the maze is explored     →  known map ≈ full map
 ```
 
-**Key design**: Pacman's root moves simulate the full `pacman_speed` (e.g., 2 tiles in a straight line), modelling the actual speed advantage. Deeper nodes use single-step moves for simplicity.
+**Implementation** (lines 144–170):
+- Internal grid initialised to `−1` (all unknown).
+- Walls (`1`) are copied on the first observation (the framework always provides all walls).
+- Visible empty cells (`0`) are merged in on every call to `update()`.
+- `get()` returns the current best-known map for pathfinding.
 
-**Return value**: `(Move, steps)` tuple that exploits speed.
+**Why it matters**: Without the memory map, the agent would only be able to pathfind
+within its current 5-cell cross.  With it, the agent can A\* through corridors it explored
+30 steps ago, even though those corridors are currently outside the FOV.
 
-**Terminal condition**: `manhattan(pac, ghost) < 2` → capture (score = -1000).
+### 3.2 Optimistic A\* (`allow_unseen` mode)
 
-#### Layer 2: Intercept Prediction (enemy visible, any range)
+Standard A\* only traverses cells known to be empty (`== 0`).  When navigating toward
+unexplored territory, this would fail because the path necessarily crosses unseen cells.
 
-Instead of chasing the Ghost's *current* position, Pacman predicts where the Ghost will be:
+**Solution**: the `allow_unseen=True` flag treats `−1` cells as passable (optimistic
+assumption — the cell is probably a corridor, not a wall).
 
+```python
+def get_neighbors(pos, known_map, allow_unseen=False):
+    checker = is_passable if allow_unseen else is_valid
+    ...
 ```
-_intercept_chase(pac_pos, ghost_pos, map_state)
-  │
-  ├── Target 1: Ghost's current position
-  │
-  ├── Targets 2-4: Linear extrapolation
-  │     └── If Ghost moved (dr, dc) last turn, predict positions
-  │         at ghost + k*(dr,dc) for k = 1,2,3
-  │
-  ├── Targets 5+: Flee-direction prediction
-  │     └── Ghost likely moves to cells that INCREASE distance from Pacman
-  │
-  └── Pick the target with the SHORTEST A* path
-```
 
-**Why this works**: If the Ghost is running right, Pacman can cut it off by heading to a position 2-3 tiles ahead of the Ghost's trajectory.
+This is used by the Pacman exploration logic and is **never** used when the enemy position
+is known (where we want guaranteed-safe paths).
 
-#### Layer 3: Direct A* Chase
+### 3.3 Pacman-Turn BFS (`pacman_turn_distances`)
 
-Standard A* pathfinding to the Ghost's position (or last known position if Ghost is hidden).
+Models Pacman's speed-2 movement in BFS: one BFS level = one game turn.  From each cell,
+the BFS expands to all 1-step neighbors **and** all 2-step straight-line extensions.
 
-- Uses **Manhattan distance** as the heuristic (admissible, consistent)
-- Returns optimal shortest path through the maze
-- Path is **compressed** into a `(Move, steps)` tuple: consecutive same-direction moves are merged to exploit Pacman's speed multiplier
-
-#### Layer 4: Fog Exploration
-
-When the Ghost is not visible and no last-known position is available:
-
-1. **Priority 1**: Find the nearest **unseen cell** (value = -1 in map_state) and A* to an empty cell adjacent to it — this systematically reveals fog
-2. **Priority 2**: BFS flood-fill to find the **least-visited reachable cell**, scored as `visit_count * 50 + distance` — this ensures Pacman doesn't oscillate
-
-#### Layer 5: Fallback
-
-Pick the least-visited adjacent cell with a small random tiebreaker to avoid loops.
+This is used by the Ghost to assess how many *turns* (not cells) it would take Pacman to
+reach any position — a more accurate threat metric than Manhattan distance.
 
 ---
 
-## GhostAgent (Hider)
+## 4. PacmanAgent (Seek)
 
-### Strategy Layers
+### 4.1 Algorithm Selection
 
-#### Layer 1: Minimax Evasion with Alpha-Beta (BFS distance ≤ 6)
+| Situation | Algorithm | Rationale |
+|-----------|-----------|-----------|
+| Enemy visible | **A\* search** with Manhattan heuristic | Optimal shortest path through known terrain |
+| Enemy recently seen (≤15 steps) | A\* to last-known position | Ghost likely still nearby |
+| Enemy unknown | **Frontier exploration** (BFS) | Systematically uncovers unseen map regions |
 
-When Pacman is dangerously close (within 6 BFS tiles), Ghost uses **depth-4 minimax with alpha-beta pruning**.
+### 4.2 Chase Mode (enemy visible)
+
+When `enemy_position is not None` (lines 230–236):
+
+1. Run A\* from `my_position` to `enemy_position` on the known map.
+2. If no path exists on known-safe cells, retry with `allow_unseen=True`.
+3. Extract the first move and apply speed-2 if the next two moves share the same direction.
+
+**Speed-2 optimisation** (lines 318–326):
+```python
+if len(path) >= 2 and path[1] == path[0]:
+    # Two consecutive moves in the same direction → move 2 cells
+    return (move, 2)
+```
+
+### 4.3 Search Mode (enemy invisible)
+
+When `enemy_position is None` (lines 240–267):
+
+**Phase 1 — Last-Known Pursuit** (lines 243–251):
+If the ghost was spotted within the last 15 steps, A\* toward the last-known position.
+When we arrive there (distance ≤ 1), clear the stale target and switch to exploration.
+
+**Phase 2 — Frontier Exploration** (lines 253–264):
+Find and navigate to the nearest **frontier cell** — a known-empty cell adjacent to at
+least one unseen (`−1`) cell.  Moving there maximises the chance of revealing new corridors.
+
+**Frontier-finding algorithm** (`_find_frontier_target`, lines 269–314):
+```
+BFS from my_position over known-empty cells:
+  for each cell in BFS order:
+    if cell has at least one unseen neighbor → it's a frontier
+    return the nearest frontier cell
+  if no frontier exists → map fully explored → patrol farthest cell
+```
+
+**Phase 3 — Stuck detection** (lines 211–216):
+If the agent hasn't moved for 3+ steps, it picks a new exploration target to break loops.
+
+### 4.4 Complexity
+
+| Operation | Time | Frequency |
+|-----------|------|-----------|
+| Memory map update | O(21×21) = O(441) | Every step |
+| A\* search | O(N log N), N ≤ 441 | Every step |
+| Frontier BFS | O(N), N ≤ 441 | When exploration target expires |
+| Total per step | **< 1 ms** | — |
+
+---
+
+## 5. GhostAgent (Hide)
+
+### 5.1 Core Innovation: Bayesian Belief Tracking
+
+The Ghost maintains a **21×21 probability grid** (`self.belief`) estimating where Pacman
+is likely to be.  This is updated every step via a predict–update cycle inspired by
+Bayesian filtering (Hidden Markov Model style).
+
+#### Predict Step (`_predict_belief`, lines 462–476)
+
+Before incorporating the current observation, we spread the belief forward in time:
 
 ```
-_minimax_evade(ghost_pos, pac_pos, map_state, depth=4)
-  └── For each valid direction (including STAY):
-        ├── Evaluate with _mm_ghost() minimax tree
-        │     ├── Pacman turn: minimise score (wants to catch)
-        │     └── Ghost turn: maximise score (wants to escape)
-        │
-        ├── Add bonus: +0.5 per exit at new position
-        └── Add penalty: -20 if new position is a dead-end
+For each cell (r,c) with probability P(r,c) > 0:
+    Compute all cells Pacman could reach from (r,c) in one turn
+    (speed-1 in any direction, speed-2 in a straight line, or STAY)
+    Distribute P(r,c) uniformly among those reachable cells
 ```
 
-**Evaluation function** (at leaf nodes):
+This models the uncertainty: since we don't know Pacman's strategy, we assume each
+reachable destination is equally likely.
+
+#### Update Step (lines 399–420)
+
+Two types of evidence are incorporated:
+
+| Evidence | Condition | Action |
+|----------|-----------|--------|
+| **Positive** | `enemy_position is not None` | Collapse belief: `belief = 0 everywhere; belief[enemy] = 1.0` |
+| **Negative** | Visible empty cell, no Pacman there | `belief[visible_cells] = 0` (Pacman is definitely not here) |
+
+Negative evidence is powerful: every step, the Ghost zeroes out all cells within its
+FOV.  Over time, the belief concentrates on unobserved regions, giving the Ghost a
+statistical estimate of Pacman's direction.
+
+#### Belief Centroid (`_belief_centroid`, lines 478–488)
+
+The expected Pacman position is the weighted mean:
+
 ```
-score = BFS_distance(pac → ghost) × 2  +  exit_count(ghost) × 3
+E[row] = Σ (row × belief[row,col]) / Σ belief
+E[col] = Σ (col × belief[row,col]) / Σ belief
 ```
 
-This evaluation combines:
-- **BFS distance**: True wall-aware distance (not Manhattan) — a Ghost behind a wall is safer than one in an open corridor at the same Manhattan distance
-- **Exit count**: Positions with more exits give the Ghost more escape options on future turns
+This centroid is used as the "estimated threat" for evasion when Pacman is invisible.
 
-**Alpha-beta pruning**: Cuts the search tree significantly. Worst case is O(5^4) = 625 nodes; alpha-beta typically prunes this to ~O(5^2) = 25 nodes.
+### 5.2 Three-Layer Evasion Strategy
 
-#### Layer 2: BFS Distance Maximisation (standard evasion)
+The evasion layer is selected based on the **Pacman-turn distance** (BFS accounting for
+speed-2) from the estimated threat to the Ghost's current position.
 
-For each candidate move, compute a multi-factor score:
+#### PANIC Mode (Pacman-turn distance ≤ 6)
+
+**Algorithm**: 2-ply minimax with alpha-pruning (lines 492–531).
+
+```
+For each Ghost move g₁:
+  new_ghost = apply(ghost_pos, g₁)
+  For each Pacman response p₁ ∈ pacman_next_positions(threat):
+    if manhattan(p₁, new_ghost) < 2 → caught → score = -100
+    For each Ghost follow-up g₂:
+      For each Pacman response p₂:
+        evaluate: manhattan(p₂, g₂)
+      worst_p₂ = min over all p₂
+    best_g₂ = max over all g₂ of worst_p₂
+  min_over_pac = min over all p₁ of best_g₂
+  
+  score = min_over_pac + escape_bonus + oscillation_penalty + dead_end_penalty + ptd_bonus
+  
+Choose g₁ with highest score
+```
+
+**Evaluation bonuses** (lines 520–526):
 
 | Factor | Weight | Purpose |
 |--------|--------|---------|
-| `bfs_distance` | ×4 | Primary: true wall-aware distance from Pacman |
-| `exit_count` | ×3 | Prefer junctions (3+ exits) for escape flexibility |
-| `lookahead_2` | ×1.5 | Best BFS distance reachable in 2 moves |
-| `dead_end_penalty` | -20 | **Never** walk into dead-ends (exits ≤ 1) |
-| `corridor_penalty` | -3 | Avoid straight corridors (exits = 2) where Pacman can use speed |
-| `repetition_penalty` | -3 | Don't repeat the same direction 3+ times consecutively |
-| `visit_penalty` | ×-0.5 | Avoid revisiting cells |
-| `random_tiebreaker` | +0.0-0.3 | Break score ties unpredictably |
+| `escape_bonus` | +0.15 per exit | Prefer positions with multiple escape routes |
+| `osc_penalty` | −0.3 | Penalise reversing the last move (oscillation) |
+| `dead_penalty` | −2.0 | Heavily penalise dead-ends (≤1 exit) |
+| `ptd_bonus` | +0.2 × ptd | Prefer positions farther from Pacman in turn-distance |
 
-**Why BFS distance instead of Manhattan?**
+#### CAUTION Mode (Pacman-turn distance 7–12)
 
-Manhattan distance ignores walls. A Ghost at Manhattan distance 5 from Pacman might actually be 15 BFS tiles away if there's a wall maze between them. Using BFS gives the Ghost an accurate picture of how much time it has before Pacman arrives.
+**Algorithm**: Weighted multi-factor scoring (lines 535–554).
 
-**Why penalise corridors?**
+```
+score = 2.5 × pacman_turn_distance
+      + 1.2 × num_escape_exits
+      − 1.5 × oscillation_flag
+      − 5.0 × dead_end_flag
+      − 0.5 × stay_flag
+```
 
-With `pacman_speed = 2`, Pacman can cover 2 tiles per turn in a straight line. In a corridor (only 2 exits: forward and backward), Pacman's speed advantage is devastating. At junctions (3-4 exits), Pacman must choose a direction and can only move 1 tile before hitting a wall/turn, neutralising the speed advantage.
+#### CALM Mode (Pacman-turn distance > 12)
 
-#### Layer 3: Anti-Prediction
+**Algorithm**: A\* navigation to a "haven" cell (lines 558–581).
 
-The Ghost uses several techniques to remain unpredictable:
+The haven is the reachable cell with the **maximum Pacman-turn distance** that has at
+least 2 exits (not a dead-end).  The Ghost caches this target and navigates toward it,
+invalidating the cache when Pacman moves closer to the haven than the Ghost is.
 
-1. **Move repetition penalty**: If the Ghost has moved in the same direction for 3+ consecutive turns, that direction is penalised — preventing predictable straight-line movement
-2. **Random tiebreaker**: When two moves score equally, a small random value (0.0–0.3) determines the choice — prevents Pacman from deterministically predicting the Ghost's behaviour
-3. **Visit-count tracking**: The Ghost avoids cells it has visited many times, making its movement pattern non-repeating
+### 5.3 Complexity
 
-#### Layer 4: Fog Wandering
-
-When Pacman is not visible:
-- Seek positions with **high connectivity** (many exits = junctions)
-- Avoid revisiting cells
-- Add controlled randomness for unpredictable patrol patterns
+| Operation | Time | Frequency |
+|-----------|------|-----------|
+| Memory map update | O(441) | Every step |
+| Belief predict | O(K × 9), K = non-zero cells | Every step |
+| Belief update | O(441) | Every step |
+| Pacman-turn BFS | O(441) | Every step |
+| 2-ply minimax (PANIC) | O(5 × 9 × 5 × 9) ≈ O(2025) | When in PANIC |
+| Total per step | **< 5 ms** | — |
 
 ---
 
-## Shared Algorithms
+## 6. Design Decisions
 
-### A* Search (`_a_star`)
+### Why A\* over BFS for Pacman?
 
-```
-Input:  start position, goal position, map_state
-Output: list of Move enums (optimal path), or None
+A\* with the Manhattan heuristic expands fewer nodes than BFS by guiding the search toward
+the goal.  On a 441-cell grid the difference is negligible in time, but A\* guarantees
+optimality while being conceptually cleaner for goal-directed search.
 
-Heuristic: Manhattan distance (admissible + consistent → optimal)
-Data structures:
-  - Min-heap priority queue: (f_score, g_score, counter, position)
-  - g_score dict: shortest known distance to each node
-  - parent dict: for path reconstruction
-  - counter: tiebreaker for heap stability
-```
+### Why Bayesian belief over "just go to last-known position"?
 
-**Optimisation**: Stale heap entries (where `g_score` has been updated since insertion) are skipped via the `cg != g.get(cur, cg)` check, avoiding the need for decrease-key operations.
+The last-known position becomes stale quickly: after 10+ steps, Pacman could be anywhere.
+The belief map degrades gracefully — it spreads probability outward from the last sighting
+while being continuously refined by negative evidence (visible cells without Pacman).
+This gives the Ghost a statistically meaningful estimated threat direction even 50+ steps
+after losing sight.
 
-### BFS Flood-Fill (`_bfs_distances`)
+### Why optimistic pathing for exploration?
 
-```
-Input:  start position, map_state
-Output: dict {position: distance} for all reachable cells
+The Pacman agent needs to navigate toward unseen cells.  If A\* treated unseen cells as
+walls, it could never plan a path toward them.  The optimistic assumption (`−1` = passable)
+allows the agent to commit to a path; if it turns out to be blocked, the new observation
+updates the memory map and a revised path is computed next step.
 
-Uses: collections.deque for O(1) popleft
-```
+### Why 2-ply minimax instead of deeper search?
 
-Computes the **true shortest-path distance** from `start` to every reachable cell, accounting for walls. This is the foundation for the Ghost's distance evaluation — far more accurate than Manhattan distance.
-
-### Path Compression (`_compress_path`)
-
-```
-Input:  start position, A* path (list of Moves), map_state
-Output: (first_move, steps) tuple
-
-Merges consecutive same-direction moves up to pacman_speed.
-Example: [RIGHT, RIGHT, DOWN, LEFT] with speed=2 → (RIGHT, 2)
-```
-
-This allows Pacman to exploit its speed multiplier: instead of returning `Move.RIGHT` (1 step), it returns `(Move.RIGHT, 2)` to cover 2 tiles in one turn.
+With branching factor ≈5 (Ghost) × 9 (Pacman with speed-2), a 2-ply search evaluates
+≈2,025 leaf states.  Going to 3 plies would yield ≈91K leaves — still feasible but
+approaching the 1-second budget on Colab CPUs.  2 plies provides a strong improvement over
+greedy evasion while staying comfortably within the time limit.
 
 ---
 
-## Design Decisions
+## 7. Testing Summary
 
-### 1. `map_state[r, c] != 1` instead of `== 0`
+All tests run with: `--pacman-speed 2 --capture-distance 2 --pacman-obs-radius 5 --ghost-obs-radius 5`
 
-Both agents treat **unseen cells** (value = -1, fog-of-war) as **walkable**. This is intentional:
+### Pacman (Seek) Performance
 
-- **Pacman**: Can path through fog to explore efficiently, rather than treating fog as impassable walls
-- **Ghost**: Can flee into fog-covered areas, which is strategically valuable since Pacman loses sight
+| Opponent | Mode | Win Rate | Avg Steps |
+|----------|------|----------|-----------|
+| example_student | Deterministic | 1/1 (100%) | 124 |
+| example_student | Stochastic ×10 | 9/10 (90%) | ~28 |
+| 23120219 (BFS) | Deterministic | 1/1 (100%) | 48 |
 
-Other student submissions use `== 0`, which means they treat fog as walls and cannot path through unseen areas.
+### Ghost (Hide) Performance
 
-### 2. Minimax Depth = 4
+| Opponent | Mode | Win Rate | Avg Survival |
+|----------|------|----------|--------------|
+| example_student | Deterministic | 0/1 (167 steps) | 167 |
+| example_student | Stochastic ×10 | 6/10 (60%) | ~160 |
+| 23120219 (BFS) | Deterministic | 1/1 (100%) | 200 |
 
-Depth 4 provides 2 complete rounds of play (Pacman-Ghost-Pacman-Ghost). This is deep enough to detect:
-- Imminent captures (Pacman closes in 2 turns)
-- Cornering traps (Ghost moves to dead-end → caught next turn)
-- Escape opportunities (Ghost finds a junction before Pacman arrives)
+### Self-play (×5, stochastic, 1s timeout)
 
-Depth 6 would be more accurate but risks timeout (1s limit per step). With alpha-beta pruning on the Ghost side, depth 4 evaluates ~25-100 nodes typically.
+- Pacman wins: 4/5 (avg 26 steps)
+- Ghost wins: 1/5 (survived 200 steps)
+- **No timeouts recorded.**
 
-### 3. Ghost: BFS at Minimax Leaves
+### Resource Usage
 
-The minimax leaf evaluation runs a full BFS from Pacman's position. This is expensive but critical — it gives the Ghost an accurate assessment of whether a position is truly safe (behind walls) versus merely Manhattan-far but easily reachable.
-
-### 4. Pacman: Speed-Aware Root Moves
-
-In the Pacman minimax, root moves simulate the full `pacman_speed` steps, but inner tree nodes use single-step moves. This models reality accurately (Pacman does move multiple tiles per turn) while keeping the tree manageable.
-
----
-
-## Complexity Analysis
-
-### Per-Step Worst Case
-
-| Operation | Pacman | Ghost |
-|-----------|--------|-------|
-| A* search | O(V log V) | — |
-| BFS flood-fill | O(V) | O(V) |
-| Minimax (depth 4) | O(4^4) = 256 nodes | O(5^4) = 625 nodes |
-| Minimax + BFS leaves | — | 625 × O(V) |
-| Alpha-beta pruning | — | Reduces to ~O(5^2) = 25 |
-
-Where V ≈ 220 (empty cells in the 21×21 map).
-
-**Practical timing**: On the default 21×21 map, each step completes well under the 1-second timeout, even in the worst case (Ghost minimax with BFS at every leaf).
+| Resource | Budget | Actual |
+|----------|--------|--------|
+| Time per step | 1,000 ms | < 5 ms |
+| Memory | 16 MB | < 3 KB agent state |
 
 ---
 
-## Testing
+## 8. File Structure
 
-### Commands
-
-```bash
-# Test Pacman (antigravity) vs example Ghost
-python arena.py --seek antigravity --hide example_student
-
-# Test Ghost (antigravity) vs example Pacman  
-python arena.py --seek example_student --hide antigravity
-
-# Test Ghost (antigravity) vs A* Pacman (22120016)
-python arena.py --seek 22120016 --hide antigravity
-
-# Test both agents against each other
-python arena.py --seek antigravity --hide antigravity
-
-# Stress test with fog of war
-python arena.py --seek antigravity --hide antigravity --pacman-obs-radius 5 --ghost-obs-radius 3
+```
+my_agent_lab2/
+├── agent.py            Main agent implementation (592 lines)
+└── IMPLEMENTATION.md   This document
 ```
 
-### Expected Results
+### Dependencies
 
-| Match-up | Expected Winner | Reasoning |
-|----------|----------------|-----------|
-| Antigravity Pac vs Example Ghost | Pacman | A* + intercept easily catches greedy evader |
-| Example Pac vs Antigravity Ghost | Ghost | BFS-distance + junction-seeking evades greedy chaser |
-| A* Pac (22120016) vs Antigravity Ghost | Close match | Both use advanced algorithms; Ghost's anti-cornering helps |
-| Antigravity Pac vs Antigravity Ghost | Depends | Minimax vs minimax — outcome depends on map topology |
+Only built-in libraries + `numpy`:
+
+```python
+import sys, heapq, random
+from pathlib import Path
+from collections import deque
+import numpy as np
+```

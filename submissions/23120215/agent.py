@@ -1,29 +1,32 @@
 """
-Template for student agent implementation.
+Lab 2 – Blind Adversary: Agent Implementation
 
-INSTRUCTIONS:
-1. Copy this file to submissions/<your_student_id>/agent.py
-2. Implement the PacmanAgent and/or GhostAgent classes
-3. Replace the simple logic with your search algorithm
-4. Test your agent using: python arena.py --seek <your_id> --hide example_student
+Both agents operate under PARTIAL OBSERVABILITY:
+  - Cross-shaped FOV, radius 5, blocked by walls
+  - enemy_position is None when out of line-of-sight
+  - map_state cells: 0=visible-empty, 1=wall, -1=unseen
 
-IMPORTANT:
-- Do NOT change the class names (PacmanAgent, GhostAgent)
-- Do NOT change the method signatures (step, __init__)
-- Pacman step must return either a Move or a (Move, steps) tuple where
-    1 <= steps <= pacman_speed (provided via kwargs)
-- Ghost step must return a Move enum value
-- You CAN add your own helper methods
-- You CAN import additional Python standard libraries
-- Agents are STATEFUL - you can store memory across steps
-- enemy_position may be None when limited observation is enabled
-- map_state cells: 1=wall, 0=empty, -1=unseen (fog)
+PacmanAgent (Seek):
+  A* chase when enemy visible + intelligent map-sweep exploration
+  when enemy is hidden.  Builds a persistent memory map from every
+  observation to enable pathfinding through previously-seen terrain.
+
+GhostAgent (Hide):
+  Risk-aware evasion with Pacman-position probability tracking.
+  Maintains a belief distribution over Pacman's possible locations,
+  updated each step via Bayesian filtering.  Uses minimax when Pacman
+  is visible and probability-weighted flee when Pacman is hidden.
+
+Allowed: builtins, numpy, pandas, scipy, gurobi.
+Budget: <1 s per step, <16 MB.
 """
 
 import sys
 from pathlib import Path
+from collections import deque
+import heapq
+import random
 
-# Add src to path to import the interface
 src_path = Path(__file__).parent.parent.parent / "src"
 sys.path.insert(0, str(src_path))
 
@@ -32,631 +35,557 @@ from agent_interface import GhostAgent as BaseGhostAgent
 from environment import Move
 import numpy as np
 
-from collections import deque
-import heapq
-import random
+# ──────────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────────
 
+ALL_MOVES = [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]
+MOVE_DELTAS = {m: m.value for m in ALL_MOVES}
+OPPOSITE = {
+    Move.UP: Move.DOWN, Move.DOWN: Move.UP,
+    Move.LEFT: Move.RIGHT, Move.RIGHT: Move.LEFT,
+    Move.STAY: Move.STAY,
+}
+MAP_H, MAP_W = 21, 21
+
+# ──────────────────────────────────────────────────────────────────────
+# Shared helpers
+# ──────────────────────────────────────────────────────────────────────
+
+def is_valid(pos, known_map):
+    """True if pos is in-bounds and known-empty (== 0)."""
+    r, c = pos
+    return 0 <= r < MAP_H and 0 <= c < MAP_W and known_map[r, c] == 0
+
+
+def is_passable(pos, known_map):
+    """True if pos is in-bounds and NOT a wall (could be unseen)."""
+    r, c = pos
+    return 0 <= r < MAP_H and 0 <= c < MAP_W and known_map[r, c] != 1
+
+
+def apply_move(pos, move):
+    dr, dc = move.value
+    return (pos[0] + dr, pos[1] + dc)
+
+
+def manhattan(a, b):
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def get_neighbors(pos, known_map, allow_unseen=False):
+    """Yield (next_pos, move) for valid neighbors.
+    If allow_unseen, treat -1 cells as passable (optimistic)."""
+    checker = is_passable if allow_unseen else is_valid
+    for m in ALL_MOVES:
+        nxt = apply_move(pos, m)
+        if checker(nxt, known_map):
+            yield nxt, m
+
+
+def a_star(start, goal, known_map, allow_unseen=False):
+    """A* returning list[Move]. Uses optimistic traversal if allow_unseen."""
+    if start == goal:
+        return []
+    cnt = 0
+    heap = [(manhattan(start, goal), cnt, start, [])]
+    g = {start: 0}
+    while heap:
+        _, _, cur, path = heapq.heappop(heap)
+        if cur == goal:
+            return path
+        cg = g[cur]
+        for nxt, mv in get_neighbors(cur, known_map, allow_unseen):
+            ng = cg + 1
+            if ng < g.get(nxt, 999999):
+                g[nxt] = ng
+                cnt += 1
+                heapq.heappush(heap, (ng + manhattan(nxt, goal), cnt, nxt, path + [mv]))
+    return []
+
+
+def pacman_next_positions(pac_pos, known_map):
+    """All positions Pacman can reach in one turn (speed 1 or 2)."""
+    positions = {pac_pos}
+    for m in ALL_MOVES:
+        p1 = apply_move(pac_pos, m)
+        if is_valid(p1, known_map):
+            positions.add(p1)
+            p2 = apply_move(p1, m)
+            if is_valid(p2, known_map):
+                positions.add(p2)
+    return positions
+
+
+def pacman_turn_distances(origin, known_map):
+    """BFS modelling Pacman's speed-2: 1 BFS level = 1 game turn."""
+    dist = {origin: 0}
+    queue = deque([origin])
+    while queue:
+        pos = queue.popleft()
+        d = dist[pos]
+        for m in ALL_MOVES:
+            p1 = apply_move(pos, m)
+            if is_valid(p1, known_map) and p1 not in dist:
+                dist[p1] = d + 1
+                queue.append(p1)
+            if is_valid(p1, known_map):
+                p2 = apply_move(p1, m)
+                if is_valid(p2, known_map) and p2 not in dist:
+                    dist[p2] = d + 1
+                    queue.append(p2)
+    return dist
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Persistent memory map
+# ──────────────────────────────────────────────────────────────────────
+
+class MemoryMap:
+    """
+    Accumulates observations across steps to build a persistent map.
+    Walls (1) are always visible.  Empty cells (0) are revealed when
+    within the FOV.  Cells never observed remain -1 (unknown).
+    """
+
+    def __init__(self):
+        # Start with walls known (they're always in map_state)
+        # but empty cells unknown
+        self.grid = np.full((MAP_H, MAP_W), -1, dtype=np.int8)
+        self._initialized = False
+
+    def update(self, map_state):
+        """Merge a new partial observation into the persistent map."""
+        if not self._initialized:
+            # First observation: walls are always visible everywhere
+            wall_mask = map_state == 1
+            self.grid[wall_mask] = 1
+            self._initialized = True
+        # Reveal newly visible empty cells
+        visible_empty = map_state == 0
+        self.grid[visible_empty] = 0
+
+    def get(self):
+        """Return the current best-known map."""
+        return self.grid
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  PACMAN AGENT – Blind Seek
+# ══════════════════════════════════════════════════════════════════════
 
 class PacmanAgent(BasePacmanAgent):
     """
-    Pacman (Seeker) Agent - Goal: Catch the Ghost
+    Seek agent for partial-observability arena.
 
-    Strategy layers (highest priority first):
-      1. Minimax close-combat (dist <= 8) — accounts for Pacman speed
-      2. A* with ghost-interception prediction
-      3. Direct A* chase to ghost / last known position
-      4. Systematic fog exploration via BFS to unseen cells
-      5. Visit-count fallback to avoid oscillation
+    Strategy
+    --------
+    When enemy IS visible:
+      A* chase with speed-2 optimisation (same as Lab 1).
+
+    When enemy is NOT visible:
+      1. Memory map: accumulate all observations.
+      2. If we have a last-known position, go there first.
+      3. Otherwise, run a systematic sweep: BFS toward the nearest
+         UNSEEN (-1) cell to maximise area coverage.  This is the
+         fastest way to "scan" the maze and find the ghost.
+      4. Frontier-based exploration: prefer unseen cells adjacent
+         to known-empty cells (more likely to reveal corridors).
     """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.pacman_speed = max(1, int(kwargs.get("pacman_speed", 1)))
-        self.name = "WAG Pacman"
-        # Memory for limited observation mode
+        self.memory = MemoryMap()
         self.last_known_enemy_pos = None
-        self.prev_enemy_pos = None
-        self.visited = {}
+        self.last_known_step = 0
+        self.exploration_target = None
+        self.last_position = None
+        self.stuck_count = 0
 
-    def step(self, map_state: np.ndarray,
-             my_position: tuple,
-             enemy_position: tuple,
-             step_number: int):
-        """
-        Decide the next move.
+    def step(self, map_state, my_position, enemy_position, step_number):
+        # Update memory map
+        self.memory.update(map_state)
+        known = self.memory.get()
 
-        Args:
-            map_state: 2D numpy array where 1=wall, 0=empty, -1=unseen (fog)
-            my_position: Your current (row, col) in absolute coordinates
-            enemy_position: Ghost's (row, col) if visible, None otherwise
-            step_number: Current step number (starts at 1)
-
-        Returns:
-            Move or (Move, steps): Direction to move (optionally with step count)
-        """
-        self.visited[my_position] = self.visited.get(my_position, 0) + 1
-
-        # Update memory if enemy is visible
-        if enemy_position is not None:
-            self.prev_enemy_pos = self.last_known_enemy_pos
-            self.last_known_enemy_pos = enemy_position
-
-        # --- Enemy visible: pursue aggressively ---
-        if enemy_position is not None:
-            dist = self._manhattan(my_position, enemy_position)
-
-            # Close combat: minimax for precise capture
-            if dist <= 8:
-                action = self._minimax_chase(
-                    my_position, enemy_position, map_state, depth=4
-                )
-                if action is not None:
-                    return action
-
-            # Medium range: intercept predicted ghost positions
-            action = self._intercept_chase(
-                my_position, enemy_position, map_state
-            )
-            if action is not None:
-                return action
-
-            # Direct A* fallback
-            action = self._a_star_chase(my_position, enemy_position, map_state)
-            if action is not None:
-                return action
-
-        # --- Chase last known position ---
-        if self.last_known_enemy_pos is not None:
-            action = self._a_star_chase(
-                my_position, self.last_known_enemy_pos, map_state
-            )
-            if action is not None:
-                return action
-
-        # --- Explore unseen / least-visited areas ---
-        action = self._explore(my_position, map_state)
-        if action is not None:
-            return action
-
-        return self._fallback_move(my_position, map_state)
-
-    # ── Minimax close-combat ─────────────────────────────
-
-    def _minimax_chase(self, pac, ghost, map_state, depth):
-        """Pacman minimises distance via depth-limited minimax."""
-        best_action = None
-        best_score = float('inf')
-
-        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-            steps = self._max_valid_steps(pac, move, map_state, self.pacman_speed)
-            if steps <= 0:
-                continue
-            # Simulate full speed move
-            new_pac = self._simulate_steps(pac, move, map_state, steps)
-            score = self._mm_pac(new_pac, ghost, map_state, depth - 1, False)
-            if score < best_score:
-                best_score = score
-                best_action = (move, steps)
-
-        return best_action
-
-    def _mm_pac(self, pac, ghost, map_state, depth, is_pac_turn):
-        """Minimax eval — Pacman minimises, Ghost maximises distance."""
-        if self._manhattan(pac, ghost) < 2:
-            return -1000
-        if depth <= 0:
-            return self._manhattan(pac, ghost)
-
-        if is_pac_turn:
-            best = float('inf')
-            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                nxt = self._apply_move(pac, move)
-                if self._is_valid_position(nxt, map_state):
-                    best = min(best, self._mm_pac(nxt, ghost, map_state, depth - 1, False))
-            return best
+        # Detect being stuck
+        if my_position == self.last_position:
+            self.stuck_count += 1
         else:
-            best = -float('inf')
-            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT, Move.STAY]:
-                nxt = self._apply_move(ghost, move)
-                if not self._is_valid_position(nxt, map_state):
-                    continue
-                best = max(best, self._mm_pac(pac, nxt, map_state, depth - 1, True))
+            self.stuck_count = 0
+        self.last_position = my_position
+
+        # Enemy visible → chase
+        if enemy_position is not None:
+            self.last_known_enemy_pos = enemy_position
+            self.last_known_step = step_number
+            self.exploration_target = None
+            return self._chase(my_position, enemy_position, known)
+
+        # Enemy not visible → search
+        return self._search(my_position, known, step_number)
+
+    # ── Chase (enemy visible) ─────────────────────────────────────────
+
+    def _chase(self, my_pos, enemy_pos, known):
+        path = a_star(my_pos, enemy_pos, known, allow_unseen=False)
+        if not path:
+            path = a_star(my_pos, enemy_pos, known, allow_unseen=True)
+        if path:
+            return self._speed_action(my_pos, path, known)
+        return self._greedy_toward(my_pos, enemy_pos, known)
+
+    # ── Search (enemy invisible) ──────────────────────────────────────
+
+    def _search(self, my_pos, known, step_number):
+        # 1. If we have a stale last-known position, go there first
+        #    (but only if it's recent – within 15 steps)
+        if (self.last_known_enemy_pos is not None
+                and step_number - self.last_known_step <= 15):
+            path = a_star(my_pos, self.last_known_enemy_pos, known, allow_unseen=True)
+            if path:
+                # Reached it or close → clear
+                if manhattan(my_pos, self.last_known_enemy_pos) <= 1:
+                    self.last_known_enemy_pos = None
+                else:
+                    return self._speed_action(my_pos, path, known)
+
+        # 2. Frontier-based exploration: find nearest unseen cell
+        #    adjacent to a known-empty cell (= exploration frontier)
+        if (self.exploration_target is None
+                or self.exploration_target == my_pos
+                or self.stuck_count > 3):
+            self.exploration_target = self._find_frontier_target(my_pos, known)
+            self.stuck_count = 0
+
+        if self.exploration_target:
+            path = a_star(my_pos, self.exploration_target, known, allow_unseen=True)
+            if path:
+                return self._speed_action(my_pos, path, known)
+
+        # 3. Fallback: random walk
+        return self._random_move(my_pos, known)
+
+    def _find_frontier_target(self, my_pos, known):
+        """
+        BFS from my_pos over known-empty cells.  Return the nearest
+        known-empty cell that has at least one unseen (-1) neighbor.
+        This cell is the 'frontier' – going there will reveal new area.
+        """
+        queue = deque([(my_pos, 0)])
+        seen = {my_pos}
+        best = None
+        best_dist = float("inf")
+
+        while queue:
+            pos, d = queue.popleft()
+            if d > best_dist:
+                break
+            # Check if this cell is adjacent to unseen territory
+            has_unseen_neighbor = False
+            for m in ALL_MOVES:
+                nr, nc = pos[0] + m.value[0], pos[1] + m.value[1]
+                if 0 <= nr < MAP_H and 0 <= nc < MAP_W and known[nr, nc] == -1:
+                    has_unseen_neighbor = True
+                    break
+            if has_unseen_neighbor and d > 0:
+                if d < best_dist:
+                    best = pos
+                    best_dist = d
+                continue  # Don't need to search further from this branch
+
+            for nxt, _ in get_neighbors(pos, known, allow_unseen=False):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    queue.append((nxt, d + 1))
+
+        if best is not None:
             return best
 
-    # ── Intercept predicted ghost path ───────────────────
+        # No frontier found – all map explored.  Pick a far-away cell
+        # for random patrol.
+        farthest = None
+        fd = -1
+        for pos in seen:
+            d_val = manhattan(pos, my_pos)
+            if d_val > fd:
+                fd = d_val
+                farthest = pos
+        return farthest
 
-    def _intercept_chase(self, pac, ghost, map_state):
-        """Target ghost's predicted future positions for interception."""
-        targets = [ghost]
+    # ── Speed-2 action builder ────────────────────────────────────────
 
-        # Linear extrapolation from previous position
-        if self.prev_enemy_pos is not None:
-            dr = ghost[0] - self.prev_enemy_pos[0]
-            dc = ghost[1] - self.prev_enemy_pos[1]
-            if dr != 0 or dc != 0:
-                r, c = ghost
-                for k in range(1, 4):
-                    p = (r + dr * k, c + dc * k)
-                    if self._is_valid_position(p, map_state):
-                        targets.append(p)
-                    else:
-                        break
+    def _speed_action(self, pos, path, known):
+        move = path[0]
+        steps = 1
+        if self.pacman_speed >= 2 and len(path) >= 2 and path[1] == move:
+            p1 = apply_move(pos, move)
+            p2 = apply_move(p1, move)
+            if is_valid(p1, known) and is_valid(p2, known):
+                steps = 2
+        return (move, steps)
 
-        # Ghost likely flees AWAY from Pacman
-        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-            nxt = self._apply_move(ghost, move)
-            if (self._is_valid_position(nxt, map_state)
-                    and self._manhattan(nxt, pac) > self._manhattan(ghost, pac)):
-                if nxt not in targets:
-                    targets.append(nxt)
+    def _greedy_toward(self, pos, target, known):
+        best_move, best_d = Move.STAY, manhattan(pos, target)
+        for nxt, m in get_neighbors(pos, known, allow_unseen=True):
+            d = manhattan(nxt, target)
+            if d < best_d:
+                best_d, best_move = d, m
+        return (best_move, 1)
 
-        # Pick the target reachable with the shortest A* path
-        best_action, best_len = None, float('inf')
-        for t in targets:
-            path = self._a_star(pac, t, map_state)
-            if path is not None and len(path) < best_len:
-                best_len = len(path)
-                best_action = self._compress_path(pac, path, map_state)
-        return best_action
-
-    # ── Direct A* chase ──────────────────────────────────
-
-    def _a_star_chase(self, start, target, map_state):
-        """Chase a target using A* pathfinding."""
-        path = self._a_star(start, target, map_state)
-        if path:
-            return self._compress_path(start, path, map_state)
-        return None
-
-    # ── Fog exploration ──────────────────────────────────
-
-    def _explore(self, pos, map_state):
-        """Explore toward unseen cells, or visit least-visited areas."""
-        h, w = map_state.shape
-
-        # Priority 1: BFS to nearest empty cell adjacent to unseen fog
-        unseen = []
-        for r in range(h):
-            for c in range(w):
-                if map_state[r, c] == -1:
-                    unseen.append((self._manhattan(pos, (r, c)), r, c))
-        if unseen:
-            unseen.sort()
-            for _, r, c in unseen[:20]:
-                for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                    adj = self._apply_move((r, c), move)
-                    if (self._is_valid_position(adj, map_state)
-                            and map_state[adj[0], adj[1]] == 0):
-                        path = self._a_star(pos, adj, map_state)
-                        if path:
-                            return self._compress_path(pos, path, map_state)
-
-        # Priority 2: least-visited reachable cell
-        bfs = self._bfs_distances(pos, map_state)
-        best_target, best_score = None, float('inf')
-        for cell, dist in bfs.items():
-            if dist == 0:
-                continue
-            score = self.visited.get(cell, 0) * 50 + dist
-            if score < best_score:
-                best_score = score
-                best_target = cell
-        if best_target:
-            path = self._a_star(pos, best_target, map_state)
-            if path:
-                return self._compress_path(pos, path, map_state)
-        return None
-
-    # ── Fallback ─────────────────────────────────────────
-
-    def _fallback_move(self, pos, map_state):
-        """Emergency: pick least-visited adjacent cell."""
-        candidates = []
-        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-            nxt = self._apply_move(pos, move)
-            if self._is_valid_position(nxt, map_state):
-                visits = self.visited.get(nxt, 0)
-                candidates.append((visits, random.random(), move))
-        if candidates:
-            candidates.sort()
-            m = candidates[0][2]
-            steps = self._max_valid_steps(pos, m, map_state, self.pacman_speed)
-            return (m, max(1, steps))
+    def _random_move(self, pos, known):
+        moves = list(ALL_MOVES)
+        random.shuffle(moves)
+        for m in moves:
+            if is_valid(apply_move(pos, m), known):
+                return (m, 1)
         return (Move.STAY, 1)
 
-    # ── Core algorithms ──────────────────────────────────
 
-    def _a_star(self, start, goal, map_state):
-        """A* search returning list of Move enums, or None."""
-        if start == goal:
-            return []
-        heap = []
-        g = {start: 0}
-        parent = {}
-        mfrom = {}
-        cnt = 0
-        heapq.heappush(heap, (self._manhattan(start, goal), 0, cnt, start))
-        while heap:
-            _, cg, _, cur = heapq.heappop(heap)
-            if cur == goal:
-                path = []
-                while cur in parent:
-                    path.append(mfrom[cur])
-                    cur = parent[cur]
-                path.reverse()
-                return path
-            if cg != g.get(cur, cg):
-                continue
-            for d in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                n = self._apply_move(cur, d)
-                if not self._is_valid_position(n, map_state):
-                    continue
-                ng = cg + 1
-                if ng < g.get(n, 1 << 30):
-                    g[n] = ng
-                    parent[n] = cur
-                    mfrom[n] = d
-                    cnt += 1
-                    heapq.heappush(heap, (ng + self._manhattan(n, goal), ng, cnt, n))
-        return None
-
-    def _bfs_distances(self, start, map_state):
-        """BFS flood-fill returning {pos: distance}."""
-        dist = {start: 0}
-        q = deque([start])
-        while q:
-            p = q.popleft()
-            d = dist[p]
-            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                n = self._apply_move(p, move)
-                if self._is_valid_position(n, map_state) and n not in dist:
-                    dist[n] = d + 1
-                    q.append(n)
-        return dist
-
-    def _compress_path(self, start, path, map_state):
-        """Compress consecutive same-direction moves into (Move, steps)."""
-        if not path:
-            return None
-        first = path[0]
-        steps, cur = 0, start
-        for m in path:
-            if m != first or steps >= self.pacman_speed:
-                break
-            nxt = self._apply_move(cur, m)
-            if not self._is_valid_position(nxt, map_state):
-                break
-            cur = nxt
-            steps += 1
-        return (first, steps) if steps > 0 else None
-
-    def _simulate_steps(self, pos, move, map_state, steps):
-        """Simulate multi-step movement, stopping at walls."""
-        cur = pos
-        for _ in range(steps):
-            nxt = self._apply_move(cur, move)
-            if self._is_valid_position(nxt, map_state):
-                cur = nxt
-            else:
-                break
-        return cur
-
-    # ── Helper methods (from template) ───────────────────
-
-    def _max_valid_steps(self, pos: tuple, move: Move, map_state: np.ndarray, max_steps: int) -> int:
-        steps = 0
-        current = pos
-        for _ in range(max_steps):
-            delta_row, delta_col = move.value
-            next_pos = (current[0] + delta_row, current[1] + delta_col)
-            if not self._is_valid_position(next_pos, map_state):
-                break
-            steps += 1
-            current = next_pos
-        return steps
-
-    def _is_valid_move(self, pos: tuple, move: Move, map_state: np.ndarray) -> bool:
-        """Check if a move from pos is valid for at least one step."""
-        return self._max_valid_steps(pos, move, map_state, 1) == 1
-
-    def _is_valid_position(self, pos: tuple, map_state: np.ndarray) -> bool:
-        """Check if a position is valid (not a wall and within bounds)."""
-        row, col = pos
-        height, width = map_state.shape
-        if row < 0 or row >= height or col < 0 or col >= width:
-            return False
-        return map_state[row, col] != 1  # walkable: empty (0) or unseen (-1)
-
-    def _apply_move(self, pos, move):
-        dr, dc = move.value
-        return (pos[0] + dr, pos[1] + dc)
-
-    def _manhattan(self, a, b):
-        return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
+# ══════════════════════════════════════════════════════════════════════
+#  GHOST AGENT – Blind Hide with Bayesian belief tracking
+# ══════════════════════════════════════════════════════════════════════
 
 class GhostAgent(BaseGhostAgent):
     """
-    Ghost (Hider) Agent - Goal: Avoid being caught
+    Hide agent for partial-observability arena.
 
-    Strategy layers:
-      1. Minimax evasion (BFS dist <= 6) with alpha-beta pruning
-      2. BFS-distance maximisation (true wall-aware distance, not Manhattan)
-         - Heavily penalises dead-ends (exits <= 1)
-         - Prefers junctions (exits >= 3) for escape flexibility
-         - 2-step lookahead for sustained distance
-         - Accounts for Pacman speed in danger assessment
-      3. Anti-prediction: controlled randomness + move-repeat penalty
-      4. Fog wandering: seek high-connectivity junctions
+    Key idea: maintain a BELIEF MAP – a probability distribution over
+    where Pacman might be.  Each step:
+
+      1. PREDICT: spread the belief according to Pacman's possible
+         moves (speed-2 straight or speed-1 turn).
+      2. UPDATE: if Pacman is visible, collapse belief to a point.
+         If cells are visible and Pacman is NOT there, zero out
+         those cells (negative evidence).
+      3. ACT: use the belief centroid (expected Pacman position) as
+         the threat direction for evasion.
+
+    Evasion strategy mirrors Lab 1's risk-aware approach but uses the
+    belief-estimated threat instead of true position.
     """
+
+    PANIC_THRESHOLD = 6
+    CAUTION_THRESHOLD = 12
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.name = "WAG Ghost"
-        # Memory for limited observation mode
+        self.memory = MemoryMap()
+        self.last_move = None
+        self._haven_target = None
+        # Belief: probability that Pacman is at each cell
+        # Initialised uniformly over non-wall cells on first step
+        self.belief = None
+        self._belief_initialized = False
         self.last_known_enemy_pos = None
-        self.prev_moves = []
-        self.visited = {}
+        self.steps_since_seen = 999
 
-    def step(self, map_state: np.ndarray,
-             my_position: tuple,
-             enemy_position: tuple,
-             step_number: int) -> Move:
-        """
-        Decide the next move.
+    # ── main entry ────────────────────────────────────────────────────
 
-        Args:
-            map_state: 2D numpy array where 1=wall, 0=empty, -1=unseen (fog)
-            my_position: Your current (row, col) in absolute coordinates
-            enemy_position: Pacman's (row, col) if visible, None otherwise
-            step_number: Current step number (starts at 1)
+    def step(self, map_state, my_position, enemy_position, step_number):
+        self.memory.update(map_state)
+        known = self.memory.get()
 
-        Returns:
-            Move: One of Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT, Move.STAY
-        """
-        self.visited[my_position] = self.visited.get(my_position, 0) + 1
+        # Initialise belief on first step
+        if not self._belief_initialized:
+            self._init_belief(known)
+            self._belief_initialized = True
 
-        # Update memory if enemy is visible
+        # ── Belief update ─────────────────────────────────────────────
+        # 1. Predict: spread belief via Pacman's movement model
+        if step_number > 1:
+            self._predict_belief(known)
+
+        # 2. Update with observation
         if enemy_position is not None:
+            # Positive sighting: collapse belief
+            self.belief[:] = 0.0
+            self.belief[enemy_position[0], enemy_position[1]] = 1.0
             self.last_known_enemy_pos = enemy_position
+            self.steps_since_seen = 0
+        else:
+            self.steps_since_seen += 1
+            # Negative evidence: zero out all visible empty cells
+            visible_mask = (map_state == 0)
+            self.belief[visible_mask] = 0.0
+            # Also zero out our own position
+            self.belief[my_position[0], my_position[1]] = 0.0
 
-        threat = enemy_position or self.last_known_enemy_pos
+        # Normalise belief
+        total = self.belief.sum()
+        if total > 0:
+            self.belief /= total
+        else:
+            # Lost track entirely – reinit uniform
+            self._init_belief(known)
 
-        # No threat info: wander toward junctions
+        # ── Decide action ─────────────────────────────────────────────
+        if enemy_position is not None:
+            # Pacman visible → use precise evasion
+            threat = enemy_position
+        else:
+            # Use belief centroid as estimated threat
+            threat = self._belief_centroid()
+
         if threat is None:
-            return self._smart_wander(my_position, map_state)
+            return self._wander(my_position, known)
 
-        # Compute BFS distance map FROM Pacman (wall-aware true distance)
-        pac_dist = self._bfs_distances(threat, map_state)
-        my_bfs_dist = pac_dist.get(my_position, 0)
+        # Compute Pacman-turn distances on the KNOWN map from threat
+        ptd = pacman_turn_distances(threat, known)
+        my_td = ptd.get(my_position, 999)
 
-        # DANGER ZONE: minimax evasion with alpha-beta
-        if my_bfs_dist <= 6:
-            action = self._minimax_evade(
-                my_position, threat, map_state, depth=4
-            )
-            if action is not None:
-                self._record_move(action)
-                return action
+        # Invalidate stale haven
+        if self._haven_target and ptd.get(self._haven_target, 999) < my_td:
+            self._haven_target = None
 
-        # Standard: maximise BFS distance with heuristics
-        return self._maximise_distance(my_position, threat, map_state, pac_dist)
+        if my_td <= self.PANIC_THRESHOLD:
+            move = self._panic(my_position, threat, known, ptd)
+        elif my_td <= self.CAUTION_THRESHOLD:
+            move = self._caution(my_position, threat, known, ptd)
+        else:
+            move = self._calm(my_position, threat, known, ptd)
 
-    # ── Minimax evasion ──────────────────────────────────
+        self.last_move = move
+        return move
 
-    def _minimax_evade(self, ghost, pac, map_state, depth):
-        """Ghost maximises distance via minimax with alpha-beta pruning."""
+    # ── Belief management ─────────────────────────────────────────────
+
+    def _init_belief(self, known):
+        """Uniform belief over all non-wall cells."""
+        self.belief = np.zeros((MAP_H, MAP_W), dtype=np.float32)
+        passable = (known != 1)  # walls always known
+        self.belief[passable] = 1.0
+        total = self.belief.sum()
+        if total > 0:
+            self.belief /= total
+
+    def _predict_belief(self, known):
+        """Spread belief: each cell's probability is distributed among
+        the cell itself (STAY) and its Pacman-reachable neighbors
+        (speed 1 or 2 in a straight line)."""
+        new_belief = np.zeros_like(self.belief)
+        # For efficiency, iterate only cells with non-zero belief
+        nonzero = np.argwhere(self.belief > 1e-9)
+        for idx in nonzero:
+            r, c = int(idx[0]), int(idx[1])
+            prob = self.belief[r, c]
+            reachable = pacman_next_positions((r, c), known)
+            share = prob / len(reachable)
+            for (nr, nc) in reachable:
+                new_belief[nr, nc] += share
+        self.belief = new_belief
+
+    def _belief_centroid(self):
+        """Return the expected (weighted mean) position of Pacman."""
+        total = self.belief.sum()
+        if total < 1e-12:
+            return self.last_known_enemy_pos
+        rows, cols = np.indices((MAP_H, MAP_W))
+        er = int(round((rows * self.belief).sum() / total))
+        ec = int(round((cols * self.belief).sum() / total))
+        er = max(0, min(MAP_H - 1, er))
+        ec = max(0, min(MAP_W - 1, ec))
+        return (er, ec)
+
+    # ── PANIC: 2-ply minimax ──────────────────────────────────────────
+
+    def _panic(self, my_pos, pac_pos, known, ptd):
+        pac_nexts = pacman_next_positions(pac_pos, known)
+
+        g_candidates = [(my_pos, Move.STAY)]
+        for nxt, m in get_neighbors(my_pos, known):
+            g_candidates.append((nxt, m))
+
         best_move = Move.STAY
-        best_score = -float('inf')
-        alpha = -float('inf')
-        beta = float('inf')
+        best_score = -float("inf")
 
-        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT, Move.STAY]:
-            nxt = self._apply_move(ghost, move)
-            if not self._is_valid_position(nxt, map_state):
-                continue
+        for g1_pos, g1_move in g_candidates:
+            min_over_pac = float("inf")
+            for p1_pos in pac_nexts:
+                if manhattan(p1_pos, g1_pos) < 2:
+                    min_over_pac = -100
+                    break
+                g2_cands = [g1_pos]
+                for g2nxt, _ in get_neighbors(g1_pos, known):
+                    g2_cands.append(g2nxt)
+                p2_nexts = pacman_next_positions(p1_pos, known)
+                best_g2 = -float("inf")
+                for g2_pos in g2_cands:
+                    worst_p2 = min(manhattan(p2, g2_pos) for p2 in p2_nexts)
+                    if worst_p2 > best_g2:
+                        best_g2 = worst_p2
+                if best_g2 < min_over_pac:
+                    min_over_pac = best_g2
 
-            score = self._mm_ghost(
-                pac, nxt, map_state, depth - 1, True, alpha, beta
-            )
-            # Bonus for escape routes at new position
-            score += self._count_exits(nxt, map_state) * 0.5
-            # Penalty for dead-ends
-            if self._count_exits(nxt, map_state) <= 1:
-                score -= 20
+            escapes = sum(1 for _ in get_neighbors(g1_pos, known))
+            escape_bonus = escapes * 0.15
+            osc_pen = -0.3 if (self.last_move and g1_move == OPPOSITE.get(self.last_move)) else 0
+            dead_pen = -2.0 if escapes <= 1 else 0
+            ptd_bonus = ptd.get(g1_pos, 0) * 0.2
 
+            score = min_over_pac + escape_bonus + osc_pen + dead_pen + ptd_bonus
             if score > best_score:
                 best_score = score
-                best_move = move
-            alpha = max(alpha, best_score)
+                best_move = g1_move
 
         return best_move
 
-    def _mm_ghost(self, pac, ghost, map_state, depth, is_pac_turn, alpha, beta):
-        """Minimax: Pacman minimises dist, Ghost maximises. Alpha-beta pruned."""
-        if self._manhattan(pac, ghost) < 2:
-            return -1000  # caught = worst for ghost
+    # ── CAUTION: weighted multi-factor ────────────────────────────────
 
-        if depth <= 0:
-            # Evaluation: BFS distance + escape routes
-            bfs = self._bfs_distances(pac, map_state)
-            bfs_dist = bfs.get(ghost, 50)
-            exits = self._count_exits(ghost, map_state)
-            return bfs_dist * 2 + exits * 3
+    def _caution(self, my_pos, pac_pos, known, ptd):
+        best_move = Move.STAY
+        best_score = -float("inf")
 
-        if is_pac_turn:
-            # Pacman minimises — also model Pacman speed by allowing 2-step
-            best = float('inf')
-            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                nxt = self._apply_move(pac, move)
-                if not self._is_valid_position(nxt, map_state):
-                    continue
-                score = self._mm_ghost(
-                    nxt, ghost, map_state, depth - 1, False, alpha, beta
-                )
-                best = min(best, score)
-                beta = min(beta, best)
-                if beta <= alpha:
-                    break
-            return best
-        else:
-            best = -float('inf')
-            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT, Move.STAY]:
-                nxt = self._apply_move(ghost, move)
-                if not self._is_valid_position(nxt, map_state):
-                    continue
-                score = self._mm_ghost(
-                    pac, nxt, map_state, depth - 1, True, alpha, beta
-                )
-                best = max(best, score)
-                alpha = max(alpha, best)
-                if beta <= alpha:
-                    break
-            return best
+        candidates = [(my_pos, Move.STAY)]
+        for nxt, m in get_neighbors(my_pos, known):
+            candidates.append((nxt, m))
 
-    # ── BFS distance maximisation ────────────────────────
+        for pos, move in candidates:
+            td = ptd.get(pos, 0)
+            escapes = sum(1 for _ in get_neighbors(pos, known))
+            osc = -1.5 if (self.last_move and move == OPPOSITE.get(self.last_move)) else 0
+            dead = -5 if escapes <= 1 else 0
+            stay_pen = -0.5 if move == Move.STAY else 0
+            score = td * 2.5 + escapes * 1.2 + osc + dead + stay_pen
+            if score > best_score:
+                best_score = score
+                best_move = move
 
-    def _maximise_distance(self, pos, pac, map_state, pac_dist):
-        """Choose the move that maximises wall-aware BFS distance from Pacman."""
-        candidates = []
+        return best_move
 
-        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-            nxt = self._apply_move(pos, move)
-            if not self._is_valid_position(nxt, map_state):
-                continue
+    # ── CALM: head toward safest haven ────────────────────────────────
 
-            # Primary: BFS distance from Pacman (wall-aware, not Manhattan)
-            bfs_d = pac_dist.get(nxt, 0)
+    def _calm(self, my_pos, pac_pos, known, ptd):
+        if self._haven_target is None or self._haven_target == my_pos:
+            self._haven_target = self._find_haven(my_pos, known, ptd)
+        if self._haven_target and self._haven_target != my_pos:
+            path = a_star(my_pos, self._haven_target, known)
+            if path:
+                return path[0]
+        return self._caution(my_pos, pac_pos, known, ptd)
 
-            # Secondary: escape routes (connectivity)
-            exits = self._count_exits(nxt, map_state)
-
-            # Tertiary: 2-step lookahead — best BFS distance reachable next turn
-            look2 = bfs_d
-            for m2 in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                nxt2 = self._apply_move(nxt, m2)
-                if self._is_valid_position(nxt2, map_state):
-                    look2 = max(look2, pac_dist.get(nxt2, 0))
-
-            # Dead-end penalty: NEVER walk into dead-ends
-            dead_pen = -20 if exits <= 1 else 0
-
-            # Corridor penalty: positions with only 2 exits (straight line)
-            # let Pacman use speed — prefer junctions
-            corridor_pen = -3 if exits == 2 else 0
-
-            # Anti-repetition: penalise repeating same direction 3+ times
-            rep_pen = 0
-            if (len(self.prev_moves) >= 2
-                    and self.prev_moves[-1] == move
-                    and self.prev_moves[-2] == move):
-                rep_pen = -3
-
-            # Visit penalty: avoid revisiting cells
-            visit_pen = -self.visited.get(nxt, 0) * 0.5
-
-            score = (bfs_d * 4
-                     + exits * 3
-                     + look2 * 1.5
-                     + dead_pen
-                     + corridor_pen
-                     + rep_pen
-                     + visit_pen
-                     + random.random() * 0.3)  # small random tiebreaker
-
-            candidates.append((score, move))
-
-        if candidates:
-            candidates.sort(reverse=True)
-            best = candidates[0][1]
-        else:
-            best = Move.STAY
-
-        self._record_move(best)
+    def _find_haven(self, my_pos, known, ptd):
+        best, best_td = None, -1
+        queue = deque([(my_pos, 0)])
+        seen = {my_pos}
+        while queue:
+            pos, d = queue.popleft()
+            exits = sum(1 for _ in get_neighbors(pos, known))
+            td = ptd.get(pos, 0)
+            if exits >= 2 and td > best_td:
+                best, best_td = pos, td
+            for nxt, _ in get_neighbors(pos, known):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    queue.append((nxt, d + 1))
         return best
 
-    # ── Fog wandering ────────────────────────────────────
+    # ── Wander (no threat estimate) ───────────────────────────────────
 
-    def _smart_wander(self, pos, map_state):
-        """When Pacman is invisible, wander toward high-connectivity junctions."""
-        best_move = Move.STAY
-        best_score = -float('inf')
-
-        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-            nxt = self._apply_move(pos, move)
-            if not self._is_valid_position(nxt, map_state):
-                continue
-
-            exits = self._count_exits(nxt, map_state)
-            score = exits * 3.0
-
-            # Avoid revisiting
-            score -= self.visited.get(nxt, 0) * 0.5
-
-            # Anti-repetition
-            if self.prev_moves and self.prev_moves[-1] == move:
-                score -= 0.5
-
-            # Small randomness for unpredictability
-            score += random.random() * 0.5
-
-            if score > best_score:
-                best_score = score
-                best_move = move
-
-        self._record_move(best_move)
-        return best_move
-
-    # ── Core algorithms ──────────────────────────────────
-
-    def _bfs_distances(self, start, map_state):
-        """BFS flood-fill returning {pos: distance}."""
-        dist = {start: 0}
-        q = deque([start])
-        while q:
-            p = q.popleft()
-            d = dist[p]
-            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                n = self._apply_move(p, move)
-                if self._is_valid_position(n, map_state) and n not in dist:
-                    dist[n] = d + 1
-                    q.append(n)
-        return dist
-
-    def _count_exits(self, pos, map_state):
-        """Count number of valid moves from a position."""
-        count = 0
-        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-            nxt = self._apply_move(pos, move)
-            if self._is_valid_position(nxt, map_state):
-                count += 1
-        return count
-
-    def _record_move(self, move):
-        """Track recent moves for anti-repetition."""
-        self.prev_moves.append(move)
-        if len(self.prev_moves) > 10:
-            self.prev_moves.pop(0)
-
-    # ── Helper methods (from template) ───────────────────
-
-    def _is_valid_move(self, pos: tuple, move: Move, map_state: np.ndarray) -> bool:
-        """Check if a move from pos is valid."""
-        delta_row, delta_col = move.value
-        new_pos = (pos[0] + delta_row, pos[1] + delta_col)
-        return self._is_valid_position(new_pos, map_state)
-
-    def _is_valid_position(self, pos: tuple, map_state: np.ndarray) -> bool:
-        """Check if a position is valid (not a wall and within bounds)."""
-        row, col = pos
-        height, width = map_state.shape
-        if row < 0 or row >= height or col < 0 or col >= width:
-            return False
-        return map_state[row, col] != 1  # walkable: empty (0) or unseen (-1)
-
-    def _apply_move(self, pos, move):
-        dr, dc = move.value
-        return (pos[0] + dr, pos[1] + dc)
-
-    def _manhattan(self, a, b):
-        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+    def _wander(self, pos, known):
+        moves = list(ALL_MOVES)
+        random.shuffle(moves)
+        for m in moves:
+            if is_valid(apply_move(pos, m), known):
+                return m
+        return Move.STAY

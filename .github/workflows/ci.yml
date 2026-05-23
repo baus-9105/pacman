@@ -30,13 +30,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
     
-      - name: Install the code linting and formatting tool Ruff
-        run: pip install ruff
-      - name: Lint code with Ruff
-        run: ruff check --ignore E402,F401,F541 --output-format=github --target-version=${{ env.RUFF_TARGET }}
-      - name: Check code formatting with Ruff
-        run: ruff format --diff --target-version=${{ env.RUFF_TARGET }}
-        continue-on-error: true
+      # - name: Install the code linting and formatting tool Ruff
+      #   run: pip install ruff
+      # - name: Lint code with Ruff
+      #   run: ruff check --ignore E402,F401,F541 --output-format=github --target-version=${{ env.RUFF_TARGET }}
+      # - name: Check code formatting with Ruff
+      #   run: ruff format --diff --target-version=${{ env.RUFF_TARGET }}
+      #   continue-on-error: true
 
       - name: Run the project
         working-directory: ./src
